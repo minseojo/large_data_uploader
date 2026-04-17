@@ -124,6 +124,13 @@ public class MultipartUploadService {
                 .toList();
     }
 
+    // ── 6. 완료된 오브젝트 삭제 (벤치마크용) ──────────────────────────────────────
+
+    public void deleteObject(String key) {
+        s3Client.deleteObject(r -> r.bucket(bucket).key(key));
+        log.info("Object deleted: key={}", key);
+    }
+
     // ── 내부 유틸 ──────────────────────────────────────────────────────────────
 
     private String generatePresignedUrl(String uploadId, String key, int partNumber) {

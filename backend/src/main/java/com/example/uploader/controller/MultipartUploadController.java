@@ -65,4 +65,13 @@ public class MultipartUploadController {
             @RequestParam String key) {
         return ResponseEntity.ok(uploadService.listParts(uploadId, key));
     }
+
+    /**
+     * 벤치마크용: 완료된 오브젝트 삭제
+     */
+    @PostMapping("/delete")
+    public ResponseEntity<Void> delete(@RequestBody AbortRequest req) {
+        uploadService.deleteObject(req.key());
+        return ResponseEntity.noContent().build();
+    }
 }

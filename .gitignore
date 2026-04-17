@@ -1,0 +1,16 @@
+# IDE
+.idea/
+*.iml
+
+# Gradle
+backend/.gradle/
+backend/bin/
+backend/build/
+backend/target/
+
+# Claude
+.claude/
+
+# 벤치마크 결과
+benchmark_results_*.csv
+benchmark_results_1GBcsv
