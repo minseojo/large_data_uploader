@@ -3,8 +3,8 @@
  * 청크 크기 × 동시 업로드 수 모든 조합으로 멀티파트 업로드 성능 측정
  *
  * 사용법:
- *   node benchmark.mjs           → S3 멀티파트 (SeaweedFS, 8080)
- *   node benchmark.mjs local     → Spring Boot 로컬 디스크 (8081)
+ *   node benchmark.mjs           → S3 멀티파트 (SeaweedFS)
+ *   node benchmark.mjs local     → Spring Boot 로컬 디스크
  *   node benchmark.mjs both      → 두 방식 순서대로 비교
  *
  * 결과: benchmark_results_<날짜>.csv
@@ -18,13 +18,18 @@ import { statSync } from 'fs';
 
 // ── 설정 ──────────────────────────────────────────────────────────────────────
 
-const FILE_PATH   = 'D:/도로공사/2025_02_18_도로공사/포인트클라우드_3D타일결과물/HDRPC-ChangNyeong-MiRyang/result.tdb';
-const S3_URL      = 'http://localhost:8080/api/upload';
-const LOCAL_URL   = 'http://localhost:8081/api/local/upload';
-const MODE        = process.argv[2] ?? 's3'; // 's3' | 'local' | 'both'
+const FILE_PATH        = 'D:/raster_data/guro/grs80_25cm_cog.tif';
+const BASE_URL         = 'http://192.168.0.30:8081';
+const S3_URL           = `${BASE_URL}/api/upload`;
+const LOCAL_URL        = `${BASE_URL}/api/local/upload`;
+const LOCAL_SEQ_URL    = `${BASE_URL}/api/local/upload-seq`;
+const LOCAL_STREAM_URL = `${BASE_URL}/api/local/upload-stream`;
+const LOCAL_MMAP_URL   = `${BASE_URL}/api/local/upload-mmap`;
+const MODE        = process.argv[2] ?? 's3'; // 's3' | 'local' | 'local-seq' | 'local-stream' | 'local-mmap' | 'both'
 
-const CHUNK_SIZES_MB = [5, 8, 16, 25, 50, 64, 100, 150];
-const CONCURRENCIES  = [2, 4, 6, 8, 10, 16];
+// 동시성 비교 테스트 (청크 고정 32MB, 동시성 1~16)
+const CHUNK_SIZES_MB = [32];
+const CONCURRENCIES  = [1, 2, 4, 8];
 
 // ── HTTP 유틸 ─────────────────────────────────────────────────────────────────
 
@@ -173,17 +178,20 @@ async function runS3Upload(filePath, chunkMB, concurrency) {
     }
   }
 
+  const t0 = performance.now();
   await Promise.all(Array.from({ length: concurrency }, worker));
   fs.closeSync(fd);
   console.log();
+  const transferMs = performance.now() - t0;
 
+  const t1 = performance.now();
   const resp = await postJson(S3_URL, '/multipart/complete', { uploadId, key, parts: etags });
+  const completeMs = performance.now() - t1;
 
-  // 업로드 후 삭제
   await postJson(S3_URL, '/multipart/delete', { key }).catch(() => {});
   console.log(`  삭제: ${key}`);
 
-  return resp.location;
+  return { transferMs, completeMs, location: resp.location };
 }
 
 // ── 로컬 디스크 업로드 ────────────────────────────────────────────────────────
@@ -194,7 +202,9 @@ async function runLocalUpload(filePath, chunkMB, concurrency) {
   const fileName   = path.basename(filePath);
   const totalParts = Math.ceil(fileSize / chunkBytes);
 
-  const { uploadId } = await postJson(LOCAL_URL, '/init', { filename: fileName });
+  const { uploadId } = await postJson(LOCAL_URL, '/init', {
+    filename: fileName, totalSize: fileSize, chunkSize: chunkBytes,
+  });
 
   const fd = fs.openSync(filePath, 'r');
   let idx = 0, done = 0;
@@ -214,17 +224,146 @@ async function runLocalUpload(filePath, chunkMB, concurrency) {
     }
   }
 
+  const t0 = performance.now();
   await Promise.all(Array.from({ length: concurrency }, worker));
   fs.closeSync(fd);
   console.log();
+  const transferMs = performance.now() - t0;
 
+  const t1 = performance.now();
   const resp = await postJson(LOCAL_URL, '/complete', { uploadId });
+  const completeMs = performance.now() - t1;
 
-  // 업로드 후 로컬 파일 삭제
-  await postJson(LOCAL_URL, '/abort', { uploadId }).catch(() => {});
+  await postJson(LOCAL_URL, '/delete', { location: resp.location }).catch(() => {});
   console.log(`  삭제: ${resp.location}`);
 
-  return resp.location;
+  return { transferMs, completeMs, location: resp.location };
+}
+
+// ── 로컬 순차 병합 업로드 ─────────────────────────────────────────────────────
+
+async function runLocalSeqUpload(filePath, chunkMB, concurrency) {
+  const chunkBytes = chunkMB * 1024 * 1024;
+  const fileSize   = statSync(filePath).size;
+  const fileName   = path.basename(filePath);
+  const totalParts = Math.ceil(fileSize / chunkBytes);
+
+  const { uploadId } = await postJson(LOCAL_SEQ_URL, '/init', { filename: fileName });
+
+  const fd = fs.openSync(filePath, 'r');
+  let idx = 0, done = 0;
+
+  async function worker() {
+    while (idx < totalParts) {
+      const partIdx    = idx++;
+      const partNumber = partIdx + 1;
+      const offset     = partIdx * chunkBytes;
+      const size       = Math.min(chunkBytes, fileSize - offset);
+      const buf        = await readChunk(fd, offset, size);
+      await postChunk(
+        `${LOCAL_SEQ_URL}/chunk?uploadId=${uploadId}&partNumber=${partNumber}`,
+        buf, fileName
+      );
+      process.stdout.write(`\r  파트 ${++done}/${totalParts} 완료`);
+    }
+  }
+
+  const t0 = performance.now();
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  fs.closeSync(fd);
+  console.log();
+  const transferMs = performance.now() - t0;
+
+  const t1 = performance.now();
+  const resp = await postJson(LOCAL_SEQ_URL, '/complete', { uploadId });
+  const completeMs = performance.now() - t1;
+
+  await postJson(LOCAL_SEQ_URL, '/delete', { location: resp.location }).catch(() => {});
+  console.log(`  삭제: ${resp.location}`);
+
+  return { transferMs, completeMs, location: resp.location };
+}
+
+// ── 로컬 스트림 업로드 (청킹 없이 단일 전송) ──────────────────────────────────
+
+async function runLocalStreamUpload(filePath, chunkMB, concurrency) {
+  // stream은 청킹/동시성 파라미터 무관 — 단일 스트림으로 전송
+  const fileSize = statSync(filePath).size;
+  const fileName = path.basename(filePath);
+
+  const { uploadId } = await postJson(LOCAL_STREAM_URL, '/init', { filename: fileName });
+
+  const t0 = performance.now();
+  await new Promise((resolve, reject) => {
+    const parsed = new URL(`${LOCAL_STREAM_URL}/send?uploadId=${uploadId}`);
+    const req = http.request({
+      hostname: parsed.hostname,
+      port:     parsed.port,
+      path:     parsed.pathname + parsed.search,
+      method:   'POST',
+      headers:  { 'Content-Type': 'application/octet-stream', 'Content-Length': fileSize },
+    }, res => {
+      res.on('data', () => {});
+      res.on('end', () => res.statusCode >= 400 ? reject(new Error(`HTTP ${res.statusCode}`)) : resolve());
+    });
+    req.on('error', reject);
+    fs.createReadStream(filePath).pipe(req);
+  });
+  process.stdout.write(`\r  전송 완료`);
+  console.log();
+  const transferMs = performance.now() - t0;
+
+  const t1 = performance.now();
+  const resp = await postJson(LOCAL_STREAM_URL, '/complete', { uploadId });
+  const completeMs = performance.now() - t1;
+
+  await postJson(LOCAL_STREAM_URL, '/delete', { location: resp.location }).catch(() => {});
+  console.log(`  삭제: ${resp.location}`);
+
+  return { transferMs, completeMs, location: resp.location };
+}
+
+// ── 로컬 mmap 업로드 ──────────────────────────────────────────────────────────
+
+async function runLocalMmapUpload(filePath, chunkMB, concurrency) {
+  const chunkBytes = chunkMB * 1024 * 1024;
+  const fileSize   = statSync(filePath).size;
+  const fileName   = path.basename(filePath);
+  const totalParts = Math.ceil(fileSize / chunkBytes);
+
+  const { uploadId } = await postJson(LOCAL_MMAP_URL, '/init', {
+    filename: fileName, totalSize: fileSize, chunkSize: chunkBytes,
+  });
+
+  const fd = fs.openSync(filePath, 'r');
+  let idx = 0, done = 0;
+
+  async function worker() {
+    while (idx < totalParts) {
+      const partIdx    = idx++;
+      const partNumber = partIdx + 1;
+      const offset     = partIdx * chunkBytes;
+      const size       = Math.min(chunkBytes, fileSize - offset);
+      const buf        = await readChunk(fd, offset, size);
+      await postChunk(`${LOCAL_MMAP_URL}/chunk?uploadId=${uploadId}&partNumber=${partNumber}`, buf, fileName);
+      process.stdout.write(`\r  파트 ${++done}/${totalParts} 완료`);
+    }
+  }
+
+  const t0 = performance.now();
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  fs.closeSync(fd);
+  console.log();
+  const transferMs = performance.now() - t0;
+
+  const t1 = performance.now();
+  const resp = await postJson(LOCAL_MMAP_URL, '/complete', { uploadId });
+  const completeMs = performance.now() - t1;
+
+  await postJson(LOCAL_MMAP_URL, '/delete', { location: resp.location }).catch(() => {});
+  console.log(`  삭제: ${resp.location}`);
+
+  return { transferMs, completeMs, location: resp.location };
 }
 
 // ── 벤치마크 루프 ─────────────────────────────────────────────────────────────
@@ -246,29 +385,32 @@ async function runBenchmark(label, uploadFn) {
       const totalParts = Math.ceil(fileSize / (chunkMB * 1024 * 1024));
       console.log(`[${seq}/${total}] 청크 ${chunkMB}MB × 동시 ${concurrency}개 (파트 ${totalParts}개)`);
 
-      const startMs = performance.now();
       let status = 'success';
+      let transferSec = '-', completeSec = '-', totalSec = '-', speedMBs = '-';
 
       try {
-        await uploadFn(FILE_PATH, chunkMB, concurrency);
+        const t0 = performance.now();
+        const { transferMs, completeMs } = await uploadFn(FILE_PATH, chunkMB, concurrency);
+        const t1 = performance.now();
+        transferSec = (transferMs / 1000).toFixed(2);
+        completeSec = (completeMs / 1000).toFixed(2);
+        totalSec    = ((t1 - t0) / 1000).toFixed(2);
+        speedMBs    = (fileSize / 1e6 / parseFloat(transferSec)).toFixed(1);
       } catch (err) {
         status = 'error';
-        console.error(`  오류: ${err.message}`);
+        console.error(`  오류: ${err.message || err}`);
+        console.error(err.stack);
       }
 
-      const elapsedSec = ((performance.now() - startMs) / 1000).toFixed(2);
-      const speedMBs   = status === 'success'
-        ? (fileSize / 1e6 / parseFloat(elapsedSec)).toFixed(1) : '-';
+      console.log(`  → 전송 ${transferSec}초 / 병합 ${completeSec}초 / 합계 ${totalSec}초 / ${speedMBs} MB/s\n`);
 
-      console.log(`  → ${elapsedSec}초 / ${speedMBs} MB/s\n`);
-
-      results.push({
+      const record = {
         mode: label, chunkMB, concurrency, totalParts,
-        fileSizeMB, elapsedSec, speedMBs, status,
+        fileSizeMB, transferSec, completeSec, totalSec, speedMBs, status,
         time: new Date().toLocaleString('ko-KR'),
-      });
-
-      writeCSV(results);
+      };
+      results.push(record);
+      appendCSV(record);
     }
   }
 
@@ -289,10 +431,18 @@ async function main() {
     results = results.concat(await runBenchmark('S3-Multipart', runS3Upload));
   }
   if (MODE === 'local' || MODE === 'both') {
-    results = results.concat(await runBenchmark('Local-Disk', runLocalUpload));
+    results = results.concat(await runBenchmark('Local-Offset', runLocalUpload));
+  }
+  if (MODE === 'local-seq' || MODE === 'both') {
+    results = results.concat(await runBenchmark('Local-Seq', runLocalSeqUpload));
+  }
+  if (MODE === 'local-stream' || MODE === 'both') {
+    results = results.concat(await runBenchmark('Local-Stream', runLocalStreamUpload));
+  }
+  if (MODE === 'local-mmap' || MODE === 'both') {
+    results = results.concat(await runBenchmark('Local-Mmap', runLocalMmapUpload));
   }
 
-  writeCSV(results);
   console.log(`\n완료! 결과 파일: ${csvFilename()}`);
 }
 
@@ -302,14 +452,20 @@ function csvFilename() {
   return `benchmark_results_${new Date().toISOString().slice(0, 10)}.csv`;
 }
 
-function writeCSV(results) {
-  const header = ['방식', '청크(MB)', '동시업로드', '파트수', '파일크기(MB)', '소요시간(초)', '평균속도(MB/s)', '결과', '시각'];
-  const rows = results.map(r =>
-    [r.mode, r.chunkMB, r.concurrency, r.totalParts, r.fileSizeMB, r.elapsedSec, r.speedMBs, r.status, r.time]
-      .map(v => `"${String(v).replace(/"/g, '""')}"`)
-      .join(',')
-  );
-  fs.writeFileSync(csvFilename(), '\uFEFF' + [header.join(','), ...rows].join('\n'), 'utf8');
+const HEADER = ['방식', '청크(MB)', '동시업로드', '파트수', '파일크기(MB)', '전송시간(초)', '병합시간(초)', '합계시간(초)', '평균속도(MB/s)', '결과', '시각'];
+
+function appendCSV(record) {
+  const file = csvFilename();
+  const row = [
+    record.mode, record.chunkMB, record.concurrency, record.totalParts,
+    record.fileSizeMB, record.transferSec, record.completeSec, record.totalSec,
+    record.speedMBs, record.status, record.time,
+  ].map(v => `"${String(v).replace(/"/g, '""')}"`).join(',');
+
+  if (!fs.existsSync(file)) {
+    fs.writeFileSync(file, '\uFEFF' + HEADER.join(',') + '\n', 'utf8');
+  }
+  fs.appendFileSync(file, row + '\n', 'utf8');
 }
 
 main().catch(err => {

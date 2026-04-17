@@ -1,5 +1,6 @@
 import { Uppy, Dashboard, AwsS3Multipart } from 'https://releases.transloadit.com/uppy/v3.21.0/uppy.min.mjs';
 
+// 백엔드 서버 주소 — 로컬 실행 시 http://localhost:8080, 원격 서버는 IP로 변경
 const BACKEND_URL = 'http://localhost:8080/api/upload';
 const MAX_FILE_BYTES = 55 * 1024 * 1024 * 1024;
 
@@ -46,7 +47,7 @@ const uppy = new Uppy({
   proudlyDisplayPoweredByUppy: false,
   locale: {
     strings: {
-      dropPasteFiles: 'GeoTIFF 파일을 드래그하거나 %{browseFiles}',
+      dropPasteFiles: '파일을 드래그하거나 %{browseFiles}',
       browseFiles: '파일 선택',
       uploadXFiles: { 0: '업로드 시작', 1: '업로드 시작' },
       uploading: '업로드 중...',
