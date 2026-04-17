@@ -7,9 +7,9 @@ import org.springframework.web.multipart.MultipartFile;
 
 import java.io.*;
 import java.nio.file.*;
-import java.util.Comparator;
+import java.util.Map;
 import java.util.UUID;
-import java.util.stream.Stream;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Service
@@ -18,94 +18,77 @@ public class LocalUploadService {
     @Value("${upload.dir}")
     private String uploadDir;
 
-    // ── 1. 업로드 세션 초기화 ──────────────────────────────────────────────────
+    private final Map<String, UploadSession> sessions = new ConcurrentHashMap<>();
 
-    public String init(String filename) throws IOException {
+    private record UploadSession(Path finalFile, RandomAccessFile raf, long chunkSize) {}
+
+    // ── 1. 세션 초기화 — 파일 미리 할당 + RAF 열어두기 ───────────────────────────
+
+    public String init(String filename, long totalSize, long chunkSize) throws IOException {
         String uploadId = UUID.randomUUID().toString();
-        Path chunkDir = chunkDir(uploadId);
-        Files.createDirectories(chunkDir);
 
-        // 원본 파일명 저장 (complete 시 사용)
-        Files.writeString(chunkDir.resolve(".filename"), filename);
+        Path finalDir = Path.of(uploadDir, "completed");
+        Files.createDirectories(finalDir);
+        Path finalFile = finalDir.resolve(uploadId + "_" + sanitize(filename));
 
-        log.info("Upload init: uploadId={}, filename={}", uploadId, filename);
+        // RAF를 열어두고 세션에 보관 — 청크마다 open/close 오버헤드 제거
+        RandomAccessFile raf = new RandomAccessFile(finalFile.toFile(), "rw");
+        raf.setLength(totalSize);
+
+        sessions.put(uploadId, new UploadSession(finalFile, raf, chunkSize));
+        log.info("Upload init: uploadId={}, file={}, size={}MB", uploadId, filename, totalSize / 1_000_000);
         return uploadId;
     }
 
-    // ── 2. 청크 수신 및 임시 저장 ──────────────────────────────────────────────
+    // ── 2. 청크 수신 → 파트 offset에 직접 write ──────────────────────────────────
 
     public void saveChunk(String uploadId, int partNumber, MultipartFile chunk) throws IOException {
-        Path chunkFile = chunkDir(uploadId).resolve(String.format("%05d", partNumber));
-        try (InputStream in = chunk.getInputStream();
-             OutputStream out = Files.newOutputStream(chunkFile)) {
-            in.transferTo(out);
+        UploadSession session = sessions.get(uploadId);
+        if (session == null) throw new IllegalArgumentException("Unknown uploadId: " + uploadId);
+
+        long offset = (long)(partNumber - 1) * session.chunkSize();
+        byte[] data = chunk.getBytes();
+
+        // RAF는 seek+write가 thread-safe하지 않으므로 세션 객체로 동기화
+        synchronized (session.raf()) {
+            session.raf().seek(offset);
+            session.raf().write(data);
         }
-        log.debug("Chunk saved: uploadId={}, part={}, size={}", uploadId, partNumber, chunk.getSize());
+        log.debug("Chunk written: part={}, offset={}, size={}", partNumber, offset, data.length);
     }
 
-    // ── 3. 청크 병합 → 최종 파일 ──────────────────────────────────────────────
+    // ── 3. 완료 — RAF 닫기 ────────────────────────────────────────────────────────
 
     public Path complete(String uploadId) throws IOException {
-        Path chunkDir = chunkDir(uploadId);
-        String filename = Files.readString(chunkDir.resolve(".filename")).trim();
-
-        Path finalDir  = Path.of(uploadDir, "completed");
-        Files.createDirectories(finalDir);
-        Path finalFile = finalDir.resolve(uploadId + "_" + filename);
-
-        // 파트 번호 순서대로 병합
-        try (OutputStream out = new BufferedOutputStream(Files.newOutputStream(finalFile), 8 * 1024 * 1024)) {
-            try (Stream<Path> parts = Files.list(chunkDir)
-                    .filter(p -> !p.getFileName().toString().startsWith("."))
-                    .sorted(Comparator.comparing(p -> p.getFileName().toString()))) {
-                for (Path part : (Iterable<Path>) parts::iterator) {
-                    Files.copy(part, out);
-                }
-            }
-        }
-
-        log.info("Upload complete: file={}, size={}MB", finalFile.getFileName(),
-                Files.size(finalFile) / 1_000_000);
-
-        // 임시 청크 디렉토리 삭제
-        deleteDir(chunkDir);
-
-        return finalFile;
+        UploadSession session = sessions.remove(uploadId);
+        if (session == null) throw new IllegalArgumentException("Unknown uploadId: " + uploadId);
+        session.raf().close();
+        log.info("Upload complete: file={}, size={}MB",
+                session.finalFile().getFileName(), Files.size(session.finalFile()) / 1_000_000);
+        return session.finalFile();
     }
 
-    // ── 4. 업로드 중단 및 임시 파일 정리 ──────────────────────────────────────
+    // ── 4. 중단 — RAF 닫고 파일 삭제 ──────────────────────────────────────────────
 
     public void abort(String uploadId) throws IOException {
-        Path chunkDir = chunkDir(uploadId);
-        if (Files.exists(chunkDir)) {
-            deleteDir(chunkDir);
+        UploadSession session = sessions.remove(uploadId);
+        if (session != null) {
+            session.raf().close();
+            Files.deleteIfExists(session.finalFile());
             log.info("Upload aborted: uploadId={}", uploadId);
         }
     }
 
-    // ── 5. 완료된 파일 삭제 (벤치마크용) ──────────────────────────────────────
+    // ── 5. 완료 파일 삭제 (벤치마크용) ────────────────────────────────────────────
 
     public void deleteCompleted(String location) throws IOException {
-        Path file = Path.of(location);
-        if (Files.exists(file)) {
-            Files.delete(file);
-            log.info("Completed file deleted: {}", file);
-        }
+        Files.deleteIfExists(Path.of(location));
+        log.info("Completed file deleted: {}", location);
     }
 
-    // ── 내부 유틸 ─────────────────────────────────────────────────────────────
+    // ── 내부 유틸 ──────────────────────────────────────────────────────────────────
 
-    private Path chunkDir(String uploadId) {
-        return Path.of(uploadDir, "chunks", uploadId);
-    }
-
-    private void deleteDir(Path dir) throws IOException {
-        try (Stream<Path> walk = Files.walk(dir)) {
-            walk.sorted(Comparator.reverseOrder())
-                .forEach(p -> {
-                    try { Files.delete(p); }
-                    catch (IOException e) { log.warn("Delete failed: {}", p); }
-                });
-        }
+    private String sanitize(String filename) {
+        return filename.replaceAll("[/\\\\]", "_").replaceAll("\\.\\.", "_");
     }
 }

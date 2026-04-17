@@ -8,8 +8,12 @@ spring:
   servlet:
     multipart:
       enabled: true
-      max-file-size: 200MB      # 단일 청크 최대 크기
+      max-file-size: 200MB
       max-request-size: 200MB
+  # stream 엔드포인트는 multipart 파싱 제외
+  mvc:
+    servlet:
+      path: /
 
 cors:
   allowed-origins:

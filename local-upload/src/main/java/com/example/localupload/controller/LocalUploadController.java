@@ -19,8 +19,11 @@ public class LocalUploadController {
 
     // 1단계: 업로드 세션 초기화
     @PostMapping("/init")
-    public ResponseEntity<Map<String, String>> init(@RequestBody Map<String, String> body) throws IOException {
-        String uploadId = uploadService.init(body.get("filename"));
+    public ResponseEntity<Map<String, String>> init(@RequestBody Map<String, Object> body) throws IOException {
+        String filename  = (String) body.get("filename");
+        long totalSize   = ((Number) body.get("totalSize")).longValue();
+        long chunkSize   = ((Number) body.get("chunkSize")).longValue();
+        String uploadId  = uploadService.init(filename, totalSize, chunkSize);
         return ResponseEntity.ok(Map.of("uploadId", uploadId));
     }
 
