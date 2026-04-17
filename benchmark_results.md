@@ -39,12 +39,12 @@
 클라이언트                 백엔드(8080) → 로컬디스크
     │                          │
     │── POST /init ────────────▶│  파일 미리 할당 (setLength)
-    │                          │  RAF 세션 유지
+    │                          │  파일 핸들 세션 유지
     │── POST chunk1 ───────────▶│  seek(offset1) → write
     │── POST chunk2 ───────────▶│  seek(offset2) → write   병렬
     │── POST chunk3 ───────────▶│  seek(offset3) → write
     │                          │
-    │── POST /complete ────────▶│  RAF close (병합 없음, 이미 완성)
+    │── POST /complete ────────▶│  파일 핸들 닫기 (병합 없음, 이미 완성)
 ```
 
 ### Local-Mmap (Memory-Mapped File) — OS 레벨 write
