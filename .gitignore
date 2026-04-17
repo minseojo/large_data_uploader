@@ -7,6 +7,10 @@ backend/.gradle/
 backend/bin/
 backend/build/
 backend/target/
+local-upload/.gradle/
+local-upload/bin/
+local-upload/build/
+local-upload/target/
 
 # Claude
 .claude/

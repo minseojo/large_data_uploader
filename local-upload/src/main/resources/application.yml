@@ -1,0 +1,17 @@
+server:
+  port: 8081
+
+upload:
+  dir: C:/upload_temp    # 청크가 임시 저장되는 로컬 디렉토리
+
+spring:
+  servlet:
+    multipart:
+      enabled: true
+      max-file-size: 200MB      # 단일 청크 최대 크기
+      max-request-size: 200MB
+
+cors:
+  allowed-origins:
+    - http://localhost:5500
+    - http://127.0.0.1:5500

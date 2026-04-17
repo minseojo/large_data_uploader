@@ -3,7 +3,9 @@
  * 청크 크기 × 동시 업로드 수 모든 조합으로 멀티파트 업로드 성능 측정
  *
  * 사용법:
- *   node benchmark.mjs
+ *   node benchmark.mjs           → S3 멀티파트 (SeaweedFS, 8080)
+ *   node benchmark.mjs local     → Spring Boot 로컬 디스크 (8081)
+ *   node benchmark.mjs both      → 두 방식 순서대로 비교
  *
  * 결과: benchmark_results_<날짜>.csv
  */
@@ -16,13 +18,15 @@ import { statSync } from 'fs';
 
 // ── 설정 ──────────────────────────────────────────────────────────────────────
 
-const FILE_PATH    = 'D:/도로공사/2025_02_18_도로공사/포인트클라우드_3D타일결과물/HDRPC-ChangNyeong-MiRyang/result.tdb';
-const BACKEND_URL  = 'http://localhost:8080/api/upload';
+const FILE_PATH   = 'D:/도로공사/2025_02_18_도로공사/포인트클라우드_3D타일결과물/HDRPC-ChangNyeong-MiRyang/result.tdb';
+const S3_URL      = 'http://localhost:8080/api/upload';
+const LOCAL_URL   = 'http://localhost:8081/api/local/upload';
+const MODE        = process.argv[2] ?? 's3'; // 's3' | 'local' | 'both'
 
-const CHUNK_SIZES_MB  = [5, 8, 16, 25, 50, 64, 100, 150];
-const CONCURRENCIES   = [2, 4, 6, 8, 10, 16];
+const CHUNK_SIZES_MB = [5, 8, 16, 25, 50, 64, 100, 150];
+const CONCURRENCIES  = [2, 4, 6, 8, 10, 16];
 
-// ── 유틸 ──────────────────────────────────────────────────────────────────────
+// ── HTTP 유틸 ─────────────────────────────────────────────────────────────────
 
 function fetchJson(url, options = {}, body = null) {
   return new Promise((resolve, reject) => {
@@ -36,14 +40,10 @@ function fetchJson(url, options = {}, body = null) {
       headers:  options.headers || {},
     }, res => {
       let data = '';
-      res.on('data', chunk => data += chunk);
+      res.on('data', c => data += c);
       res.on('end', () => {
-        if (res.statusCode >= 400) {
-          reject(new Error(`HTTP ${res.statusCode}: ${data}`));
-          return;
-        }
-        try { resolve(JSON.parse(data)); }
-        catch { resolve(data); }
+        if (res.statusCode >= 400) { reject(new Error(`HTTP ${res.statusCode}: ${data}`)); return; }
+        try { resolve(JSON.parse(data)); } catch { resolve(data); }
       });
     });
     req.on('error', reject);
@@ -61,20 +61,13 @@ function putPart(url, buffer) {
       port:     parsed.port,
       path:     parsed.pathname + parsed.search,
       method:   'PUT',
-      headers: {
-        'Content-Length': buffer.length,
-        'Content-Type':   'application/octet-stream',
-      },
+      headers:  { 'Content-Length': buffer.length, 'Content-Type': 'application/octet-stream' },
     }, res => {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
-        const etag = res.headers['etag']?.replace(/"/g, '') ?? '';
-        if (res.statusCode >= 400) {
-          reject(new Error(`PUT ${res.statusCode}: ${data}`));
-          return;
-        }
-        resolve(etag);
+        if (res.statusCode >= 400) { reject(new Error(`PUT ${res.statusCode}: ${data}`)); return; }
+        resolve(res.headers['etag']?.replace(/"/g, '') ?? '');
       });
     });
     req.on('error', reject);
@@ -83,14 +76,45 @@ function putPart(url, buffer) {
   });
 }
 
-function post(path, body) {
-  return fetchJson(`${BACKEND_URL}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  }, body);
+// multipart/form-data로 청크 POST (로컬 업로드용)
+function postChunk(url, buffer, filename) {
+  return new Promise((resolve, reject) => {
+    const boundary = `----Boundary${Date.now()}`;
+    const header = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="chunk"; filename="${filename}"\r\nContent-Type: application/octet-stream\r\n\r\n`
+    );
+    const footer = Buffer.from(`\r\n--${boundary}--\r\n`);
+    const body = Buffer.concat([header, buffer, footer]);
+
+    const parsed = new URL(url);
+    const req = http.request({
+      hostname: parsed.hostname,
+      port:     parsed.port,
+      path:     parsed.pathname + parsed.search,
+      method:   'POST',
+      headers:  {
+        'Content-Type':   `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+      },
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => {
+        if (res.statusCode >= 400) { reject(new Error(`POST ${res.statusCode}: ${data}`)); return; }
+        try { resolve(JSON.parse(data)); } catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
-// ── 청크 분할 헬퍼 ───────────────────────────────────────────────────────────
+function postJson(baseUrl, p, body) {
+  return fetchJson(`${baseUrl}${p}`, { method: 'POST', headers: { 'Content-Type': 'application/json' } }, body);
+}
+
+// ── 청크 읽기 ─────────────────────────────────────────────────────────────────
 
 function readChunk(fd, offset, size) {
   return new Promise((resolve, reject) => {
@@ -102,125 +126,131 @@ function readChunk(fd, offset, size) {
   });
 }
 
-// ── 단일 업로드 실행 ──────────────────────────────────────────────────────────
+// ── S3 멀티파트 업로드 ────────────────────────────────────────────────────────
 
-async function runUpload(filePath, chunkMB, concurrency) {
+async function runS3Upload(filePath, chunkMB, concurrency) {
   const chunkBytes = chunkMB * 1024 * 1024;
   const fileSize   = statSync(filePath).size;
   const fileName   = path.basename(filePath);
   const totalParts = Math.ceil(fileSize / chunkBytes);
 
-  // 1. 업로드 시작
-  const { uploadId, key } = await post('/multipart/create', {
-    filename:    fileName,
-    contentType: 'image/tiff',
-    size:        fileSize,
+  const { uploadId, key } = await postJson(S3_URL, '/multipart/create', {
+    filename: fileName, contentType: 'application/octet-stream', size: fileSize,
   });
 
-  // 2. 파트 번호 배열 생성
-  const partNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
-
-  // 3. Presigned URL 배치 요청 (최대 100개씩 나눔)
+  // Presigned URL 배치 발급 (100개씩)
   const presignedUrls = {};
+  const partNumbers = Array.from({ length: totalParts }, (_, i) => i + 1);
   for (let i = 0; i < partNumbers.length; i += 100) {
-    const batch = partNumbers.slice(i, i + 100);
-    const resp = await post('/multipart/sign-parts', { uploadId, key, partNumbers: batch });
+    const resp = await postJson(S3_URL, '/multipart/sign-parts', {
+      uploadId, key, partNumbers: partNumbers.slice(i, i + 100),
+    });
     Object.assign(presignedUrls, resp.presignedUrls ?? resp);
   }
 
-  // 4. 파트 병렬 업로드 — 파이프라인: PUT 중에 다음 청크 디스크 읽기 선행
-  // worker당 "현재 PUT" + "다음 청크 읽기"를 겹쳐서 네트워크 유휴 시간 제거
   const fd = fs.openSync(filePath, 'r');
   const etags = new Array(totalParts);
-  let idx = 0;
-  let done = 0;
+  let idx = 0, done = 0;
 
   async function worker() {
-    // 첫 번째 청크 미리 읽기
     if (idx >= totalParts) return;
     let partIdx = idx++;
     let buf = await readChunk(fd, partIdx * chunkBytes, Math.min(chunkBytes, fileSize - partIdx * chunkBytes));
 
     while (true) {
-      const currentPartIdx = partIdx;
-      const currentBuf     = buf;
-      const partNumber     = currentPartIdx + 1;
-      const url            = presignedUrls[partNumber];
-
-      // 현재 청크 PUT과 다음 청크 디스크 읽기를 동시에 실행
-      const nextPartIdx = idx < totalParts ? idx++ : -1;
+      const curIdx = partIdx, curBuf = buf, partNumber = curIdx + 1;
+      const nextIdx = idx < totalParts ? idx++ : -1;
       const [etag] = await Promise.all([
-        putPart(url, currentBuf),
-        nextPartIdx >= 0
-          ? readChunk(fd, nextPartIdx * chunkBytes, Math.min(chunkBytes, fileSize - nextPartIdx * chunkBytes))
-              .then(b => { buf = b; partIdx = nextPartIdx; })
+        putPart(presignedUrls[partNumber], curBuf),
+        nextIdx >= 0
+          ? readChunk(fd, nextIdx * chunkBytes, Math.min(chunkBytes, fileSize - nextIdx * chunkBytes))
+              .then(b => { buf = b; partIdx = nextIdx; })
           : Promise.resolve(),
       ]);
-
-      etags[currentPartIdx] = { PartNumber: partNumber, ETag: etag };
+      etags[curIdx] = { PartNumber: partNumber, ETag: etag };
       process.stdout.write(`\r  파트 ${++done}/${totalParts} 완료`);
-
-      if (nextPartIdx < 0) break;
+      if (nextIdx < 0) break;
     }
   }
 
-  const workers = Array.from({ length: concurrency }, worker);
-  await Promise.all(workers);
+  await Promise.all(Array.from({ length: concurrency }, worker));
   fs.closeSync(fd);
   console.log();
 
-  // 5. 완료
-  const resp = await post('/multipart/complete', {
-    uploadId,
-    key,
-    parts: etags,
-  });
+  const resp = await postJson(S3_URL, '/multipart/complete', { uploadId, key, parts: etags });
 
-  return { key, location: resp.location };
+  // 업로드 후 삭제
+  await postJson(S3_URL, '/multipart/delete', { key }).catch(() => {});
+  console.log(`  삭제: ${key}`);
+
+  return resp.location;
 }
 
-// ── 오브젝트 삭제 (백엔드 delete 엔드포인트 호출) ────────────────────────────
+// ── 로컬 디스크 업로드 ────────────────────────────────────────────────────────
 
-async function deleteFromStorage(key) {
-  try {
-    await post('/multipart/delete', { key });
-  } catch {
-    // delete 엔드포인트 없으면 무시 — 수동 삭제 필요
+async function runLocalUpload(filePath, chunkMB, concurrency) {
+  const chunkBytes = chunkMB * 1024 * 1024;
+  const fileSize   = statSync(filePath).size;
+  const fileName   = path.basename(filePath);
+  const totalParts = Math.ceil(fileSize / chunkBytes);
+
+  const { uploadId } = await postJson(LOCAL_URL, '/init', { filename: fileName });
+
+  const fd = fs.openSync(filePath, 'r');
+  let idx = 0, done = 0;
+
+  async function worker() {
+    while (idx < totalParts) {
+      const partIdx    = idx++;
+      const partNumber = partIdx + 1;
+      const offset     = partIdx * chunkBytes;
+      const size       = Math.min(chunkBytes, fileSize - offset);
+      const buf        = await readChunk(fd, offset, size);
+      await postChunk(
+        `${LOCAL_URL}/chunk?uploadId=${uploadId}&partNumber=${partNumber}`,
+        buf, fileName
+      );
+      process.stdout.write(`\r  파트 ${++done}/${totalParts} 완료`);
+    }
   }
-  console.log(`  삭제 요청: ${key}`);
+
+  await Promise.all(Array.from({ length: concurrency }, worker));
+  fs.closeSync(fd);
+  console.log();
+
+  const resp = await postJson(LOCAL_URL, '/complete', { uploadId });
+
+  // 업로드 후 로컬 파일 삭제
+  await postJson(LOCAL_URL, '/abort', { uploadId }).catch(() => {});
+  console.log(`  삭제: ${resp.location}`);
+
+  return resp.location;
 }
 
-// ── 메인 벤치마크 루프 ────────────────────────────────────────────────────────
+// ── 벤치마크 루프 ─────────────────────────────────────────────────────────────
 
-async function main() {
-  if (!fs.existsSync(FILE_PATH)) {
-    console.error(`파일을 찾을 수 없습니다: ${FILE_PATH}`);
-    process.exit(1);
-  }
-
-  const fileSize = statSync(FILE_PATH).size;
+async function runBenchmark(label, uploadFn) {
+  const fileSize   = statSync(FILE_PATH).size;
   const fileSizeMB = (fileSize / 1e6).toFixed(1);
-  const total = CHUNK_SIZES_MB.length * CONCURRENCIES.length;
+  const total      = CHUNK_SIZES_MB.length * CONCURRENCIES.length;
+  const results    = [];
+  let seq = 0;
 
-  console.log(`파일: ${path.basename(FILE_PATH)} (${fileSizeMB} MB)`);
-  console.log(`총 ${total}개 조합 테스트 시작\n`);
-
-  const results = [];
-  let done = 0;
+  console.log(`\n${'='.repeat(60)}`);
+  console.log(`[${label}] 파일: ${path.basename(FILE_PATH)} (${fileSizeMB} MB)`);
+  console.log(`총 ${total}개 조합\n`);
 
   for (const chunkMB of CHUNK_SIZES_MB) {
     for (const concurrency of CONCURRENCIES) {
-      done++;
+      seq++;
       const totalParts = Math.ceil(fileSize / (chunkMB * 1024 * 1024));
-      console.log(`[${done}/${total}] 청크 ${chunkMB}MB × 동시 ${concurrency}개 (파트 ${totalParts}개)`);
+      console.log(`[${seq}/${total}] 청크 ${chunkMB}MB × 동시 ${concurrency}개 (파트 ${totalParts}개)`);
 
       const startMs = performance.now();
       let status = 'success';
-      let key = null;
 
       try {
-        const result = await runUpload(FILE_PATH, chunkMB, concurrency);
-        key = result.key;
+        await uploadFn(FILE_PATH, chunkMB, concurrency);
       } catch (err) {
         status = 'error';
         console.error(`  오류: ${err.message}`);
@@ -228,43 +258,58 @@ async function main() {
 
       const elapsedSec = ((performance.now() - startMs) / 1000).toFixed(2);
       const speedMBs   = status === 'success'
-        ? (fileSize / 1e6 / parseFloat(elapsedSec)).toFixed(1)
-        : '-';
+        ? (fileSize / 1e6 / parseFloat(elapsedSec)).toFixed(1) : '-';
 
       console.log(`  → ${elapsedSec}초 / ${speedMBs} MB/s\n`);
 
       results.push({
-        chunkMB, concurrency, totalParts,
+        mode: label, chunkMB, concurrency, totalParts,
         fileSizeMB, elapsedSec, speedMBs, status,
         time: new Date().toLocaleString('ko-KR'),
       });
 
-      // 업로드 성공 시 스토리지에서 삭제
-      if (key) await deleteFromStorage(key);
-
-      // 결과를 즉시 파일에 기록 (중간에 중단돼도 보존)
       writeCSV(results);
     }
   }
 
+  return results;
+}
+
+// ── 메인 ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  if (!fs.existsSync(FILE_PATH)) {
+    console.error(`파일을 찾을 수 없습니다: ${FILE_PATH}`);
+    process.exit(1);
+  }
+
+  let results = [];
+
+  if (MODE === 's3' || MODE === 'both') {
+    results = results.concat(await runBenchmark('S3-Multipart', runS3Upload));
+  }
+  if (MODE === 'local' || MODE === 'both') {
+    results = results.concat(await runBenchmark('Local-Disk', runLocalUpload));
+  }
+
+  writeCSV(results);
   console.log(`\n완료! 결과 파일: ${csvFilename()}`);
 }
 
-// ── CSV 출력 ─────────────────────────────────────────────────────────────────
+// ── CSV ───────────────────────────────────────────────────────────────────────
 
 function csvFilename() {
   return `benchmark_results_${new Date().toISOString().slice(0, 10)}.csv`;
 }
 
 function writeCSV(results) {
-  const header = ['청크(MB)', '동시업로드', '파트수', '파일크기(MB)', '소요시간(초)', '평균속도(MB/s)', '결과', '시각'];
+  const header = ['방식', '청크(MB)', '동시업로드', '파트수', '파일크기(MB)', '소요시간(초)', '평균속도(MB/s)', '결과', '시각'];
   const rows = results.map(r =>
-    [r.chunkMB, r.concurrency, r.totalParts, r.fileSizeMB, r.elapsedSec, r.speedMBs, r.status, r.time]
+    [r.mode, r.chunkMB, r.concurrency, r.totalParts, r.fileSizeMB, r.elapsedSec, r.speedMBs, r.status, r.time]
       .map(v => `"${String(v).replace(/"/g, '""')}"`)
       .join(',')
   );
-  const csv = '\uFEFF' + [header.join(','), ...rows].join('\n');
-  fs.writeFileSync(csvFilename(), csv, 'utf8');
+  fs.writeFileSync(csvFilename(), '\uFEFF' + [header.join(','), ...rows].join('\n'), 'utf8');
 }
 
 main().catch(err => {
