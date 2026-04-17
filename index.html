@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>대용량 Raster 업로드</title>
+  <link href="https://releases.transloadit.com/uppy/v3.21.0/uppy.min.css" rel="stylesheet" />
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .container { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.1); padding: 32px; width: 820px; max-width: 98vw; }
+    h1 { font-size: 1.4rem; color: #1a1a2e; margin-bottom: 6px; }
+    .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 24px; }
+    #uppy-dashboard { margin-bottom: 20px; }
+    .status-bar { background: #f8f9fa; border-radius: 8px; padding: 14px 18px; font-size: 0.82rem; color: #444; line-height: 1.8; }
+    .status-bar strong { color: #1a1a2e; }
+    .badge { display: inline-block; background: #e8f4fd; color: #1565c0; border-radius: 4px; padding: 1px 7px; font-size: 0.78rem; font-weight: 600; margin-left: 4px; }
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>대용량 파일 업로드</h1>
+  <p class="subtitle">img, GeoTIFF 등 최대 50GB 파일을 SeaweedFS S3로 직접 업로드합니다.</p>
+  <div id="uppy-dashboard"></div>
+  <div class="status-bar" id="status-bar">
+    <strong>업로드 상태:</strong> 대기 중<br/>
+    <strong>청크 크기:</strong> <span class="badge">64 MB</span>
+    <strong>동시 업로드:</strong> <span class="badge">4개 파트</span>
+    <strong>최대 재시도:</strong> <span class="badge">5회</span>
+  </div>
+</div>
+
+<script type="module" src="./uploader.js"></script>
+</body>
+</html>
