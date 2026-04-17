@@ -18,8 +18,8 @@ import { statSync } from 'fs';
 
 // ── 설정 ──────────────────────────────────────────────────────────────────────
 
-const FILE_PATH        = 'D:/raster_data/guro/grs80_25cm_cog.tif';
-const BASE_URL         = 'http://192.168.0.30:8081';
+const FILE_PATH        = '/path/to/your/large-file.';
+const BASE_URL         = 'http://localhost:8080';
 const S3_URL           = `${BASE_URL}/api/upload`;
 const LOCAL_URL        = `${BASE_URL}/api/local/upload`;
 const LOCAL_SEQ_URL    = `${BASE_URL}/api/local/upload-seq`;
@@ -27,9 +27,9 @@ const LOCAL_STREAM_URL = `${BASE_URL}/api/local/upload-stream`;
 const LOCAL_MMAP_URL   = `${BASE_URL}/api/local/upload-mmap`;
 const MODE        = process.argv[2] ?? 's3'; // 's3' | 'local' | 'local-seq' | 'local-stream' | 'local-mmap' | 'both'
 
-// 동시성 비교 테스트 (청크 고정 32MB, 동시성 1~16)
-const CHUNK_SIZES_MB = [32];
-const CONCURRENCIES  = [1, 2, 4, 8];
+// 청크크기/동시성 비교 테스트
+const CHUNK_SIZES_MB = [16, 32, 64, 128];
+const CONCURRENCIES  = [1, 2, 4, 8, 16];
 
 // ── HTTP 유틸 ─────────────────────────────────────────────────────────────────
 
