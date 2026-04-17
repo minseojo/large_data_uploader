@@ -8,25 +8,105 @@
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .container { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.1); padding: 32px; width: 820px; max-width: 98vw; }
+    .container { background: #fff; border-radius: 12px; box-shadow: 0 4px 24px rgba(0,0,0,0.1); padding: 32px; width: 860px; max-width: 98vw; }
     h1 { font-size: 1.4rem; color: #1a1a2e; margin-bottom: 6px; }
-    .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 24px; }
+    .subtitle { font-size: 0.85rem; color: #666; margin-bottom: 20px; }
+
+    .controls { display: flex; gap: 20px; margin-bottom: 20px; align-items: flex-end; flex-wrap: wrap; }
+    .control-group { display: flex; flex-direction: column; gap: 5px; }
+    .control-group label { font-size: 0.8rem; font-weight: 600; color: #444; }
+    .control-group select {
+      padding: 6px 10px; border: 1px solid #ddd; border-radius: 6px;
+      font-size: 0.85rem; background: #fafafa; cursor: pointer;
+    }
+    .control-group select:focus { outline: none; border-color: #1565c0; }
+
     #uppy-dashboard { margin-bottom: 20px; }
-    .status-bar { background: #f8f9fa; border-radius: 8px; padding: 14px 18px; font-size: 0.82rem; color: #444; line-height: 1.8; }
+
+    .status-bar { background: #f8f9fa; border-radius: 8px; padding: 14px 18px; font-size: 0.82rem; color: #444; line-height: 1.9; margin-bottom: 16px; }
     .status-bar strong { color: #1a1a2e; }
     .badge { display: inline-block; background: #e8f4fd; color: #1565c0; border-radius: 4px; padding: 1px 7px; font-size: 0.78rem; font-weight: 600; margin-left: 4px; }
+    .badge.green { background: #e8f5e9; color: #2e7d32; }
+    .badge.red { background: #fce4ec; color: #c62828; }
+
+    .result-section { margin-top: 4px; }
+    .result-section h2 { font-size: 1rem; color: #1a1a2e; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.8rem; }
+    th { background: #f0f2f5; padding: 8px 10px; text-align: left; color: #555; font-weight: 600; border-bottom: 2px solid #ddd; }
+    td { padding: 7px 10px; border-bottom: 1px solid #eee; color: #333; }
+    tr:hover td { background: #fafafa; }
+    .no-results { text-align: center; color: #aaa; padding: 16px; font-size: 0.82rem; }
+
+    .export-btn {
+      margin-top: 10px; padding: 7px 16px; background: #1565c0; color: #fff;
+      border: none; border-radius: 6px; font-size: 0.82rem; cursor: pointer;
+    }
+    .export-btn:hover { background: #0d47a1; }
+    .export-btn:disabled { background: #aaa; cursor: default; }
   </style>
 </head>
 <body>
 <div class="container">
   <h1>대용량 파일 업로드</h1>
-  <p class="subtitle">img, GeoTIFF 등 최대 50GB 파일을 SeaweedFS S3로 직접 업로드합니다.</p>
+  <p class="subtitle">GeoTIFF 등 최대 50GB 파일을 SeaweedFS S3로 직접 업로드합니다.</p>
+
+  <div class="controls">
+    <div class="control-group">
+      <label>청크 크기</label>
+      <select id="chunk-size">
+        <option value="5">5 MB (AWS 최소)</option>
+        <option value="8">8 MB (Dropbox)</option>
+        <option value="16">16 MB</option>
+        <option value="25">25 MB (Google Drive)</option>
+        <option value="50">50 MB</option>
+        <option value="64" selected>64 MB (AWS 권장)</option>
+        <option value="100">100 MB (OneDrive)</option>
+        <option value="150">150 MB</option>
+      </select>
+    </div>
+    <div class="control-group">
+      <label>동시 업로드 수</label>
+      <select id="concurrency">
+        <option value="2">2개</option>
+        <option value="4" selected>4개 (AWS 기본)</option>
+        <option value="6">6개 (Uppy 기본)</option>
+        <option value="8">8개</option>
+        <option value="10">10개</option>
+        <option value="16">16개</option>
+      </select>
+    </div>
+  </div>
+
   <div id="uppy-dashboard"></div>
+
   <div class="status-bar" id="status-bar">
     <strong>업로드 상태:</strong> 대기 중<br/>
-    <strong>청크 크기:</strong> <span class="badge">64 MB</span>
-    <strong>동시 업로드:</strong> <span class="badge">4개 파트</span>
+    <strong>청크 크기:</strong> <span class="badge" id="badge-chunk">64 MB</span>
+    <strong>동시 업로드:</strong> <span class="badge" id="badge-concurrency">4개</span>
     <strong>최대 재시도:</strong> <span class="badge">5회</span>
+  </div>
+
+  <div class="result-section">
+    <h2>성능 측정 결과</h2>
+    <table id="result-table">
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>파일명</th>
+          <th>크기</th>
+          <th>청크</th>
+          <th>동시</th>
+          <th>소요 시간</th>
+          <th>평균 속도</th>
+          <th>결과</th>
+          <th>시각</th>
+        </tr>
+      </thead>
+      <tbody id="result-body">
+        <tr><td colspan="9" class="no-results">업로드 결과가 없습니다.</td></tr>
+      </tbody>
+    </table>
+    <button class="export-btn" id="export-btn" disabled>CSV 내보내기</button>
   </div>
 </div>
 
