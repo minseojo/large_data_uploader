@@ -6,6 +6,81 @@
 
 ---
 
+## 0. 업로드 방식 설명
+
+### S3-Multipart (Presigned URL)
+```
+클라이언트                 백엔드(8080)            SeaweedFS S3(8333)
+    │                          │                          │
+    │── POST /multipart/create ▶│                          │
+    │◀─ uploadId, key ──────────│                          │
+    │                          │                          │
+    │── POST /sign-parts ──────▶│                          │
+    │◀─ presignedUrls[] ────────│                          │
+    │                          │                          │
+    │── PUT chunk1 (직접) ───────────────────────────────▶│
+    │── PUT chunk2 (직접) ───────────────────────────────▶│  병렬
+    │── PUT chunk3 (직접) ───────────────────────────────▶│
+    │                          │                          │
+    │── POST /complete ────────▶│── CompleteMultipart ───▶│
+    │                          │                   (메타데이터만 연결, 즉시)
+```
+
+### Local-Offset (RandomAccessFile)
+```
+클라이언트                 백엔드(8080) → 로컬디스크
+    │                          │
+    │── POST /init ────────────▶│  파일 미리 할당 (setLength)
+    │                          │  RAF 세션 유지
+    │── POST chunk1 ───────────▶│  seek(offset1) → write
+    │── POST chunk2 ───────────▶│  seek(offset2) → write   병렬
+    │── POST chunk3 ───────────▶│  seek(offset3) → write
+    │                          │
+    │── POST /complete ────────▶│  RAF close (병합 없음, 이미 완성)
+```
+
+### Local-Seq (임시파일 순차 병합)
+```
+클라이언트                 백엔드(8080) → 로컬디스크
+    │                          │
+    │── POST /init ────────────▶│  temp 디렉토리 생성
+    │                          │
+    │── POST chunk1 ───────────▶│  00001 임시파일 저장
+    │── POST chunk2 ───────────▶│  00002 임시파일 저장   병렬
+    │── POST chunk3 ───────────▶│  00003 임시파일 저장
+    │                          │
+    │── POST /complete ────────▶│  00001 + 00002 + 00003 → 최종파일
+    │                          │  (순차 복사 I/O 발생 → +8~11초)
+```
+
+### Local-Stream (단일 스트림)
+```
+클라이언트                 백엔드(8080) → 로컬디스크
+    │                          │
+    │── POST /init ────────────▶│
+    │                          │
+    │── POST /send ─────────────▶│  단일 octet-stream
+    │   (파일 전체, 청킹 없음)    │  inputStream → BufferedOutputStream
+    │                          │
+    │── POST /complete ────────▶│  (병합 없음)
+```
+
+### Local-Mmap (Memory-Mapped File)
+```
+클라이언트                 백엔드(8080) → 로컬디스크
+    │                          │
+    │── POST /init ────────────▶│  파일 미리 할당
+    │                          │  FileChannel open
+    │── POST chunk1 ───────────▶│  channel.map(offset1, size) → buf.put() → force()
+    │── POST chunk2 ───────────▶│  channel.map(offset2, size) → buf.put() → force()  병렬
+    │── POST chunk3 ───────────▶│  channel.map(offset3, size) → buf.put() → force()
+    │                          │
+    │── POST /complete ────────▶│  channel close (병합 없음)
+    │                          │  (OS 레벨 페이지 캐시 통해 write, JVM 버퍼 복사 없음)
+```
+
+---
+
 ## 1. S3-Multipart — 청크 크기 × 동시성 전수 조사 (7GB)
 
 > 방식: SeaweedFS S3 Presigned URL 직접 PUT
@@ -92,7 +167,7 @@
 | 상황 | 추천 방식 |
 |------|---------|
 | 실무 (재시도/이어올리기 필요) | **S3-Multipart** |
-| 단순 로컬 저장, 최고 속도 | **Local-Stream** |
+| 단순 로컬 저장 + 병렬이 필요없는 상황(예: 서버와 스토리지가 LAN 연결) | **Local-Stream** |
 | 로컬 저장 + 병렬 청크 | **Local-Offset** |
 | 디스크 I/O 최적화 실험 | **Local-Mmap** |
 | 임시파일 방식 (권장 안함) | Local-Seq (병합 시간 +10초) |
